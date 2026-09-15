@@ -22,18 +22,22 @@ terraform {
 }
 
 provider "dynatrace" {
-  environment_url = var.dynatrace_environment_url
-  api_token       = var.dt_platform_token
+  dt_env_url    = local.dynatrace_environment_url
+  platform_token = local.dynatrace_platform_token
 }
 
 provider "aws" {
-  alias   = "account_a"
-  region  = var.aws_account_a_region
-  profile = var.aws_account_a_profile
+  region  = var.aws_region
+  profile = var.aws_profile
 }
 
-provider "aws" {
-  alias   = "account_b"
-  region  = var.aws_account_b_region
-  profile = var.aws_account_b_profile
+data "aws_secretsmanager_secret_version" "dynatrace" {
+  secret_id = var.dynatrace_secret_arn
+}
+
+locals {
+  dynatrace_secret = jsondecode(data.aws_secretsmanager_secret_version.dynatrace.secret_string)
+
+  dynatrace_environment_url = try(local.dynatrace_secret.DYNATRACE_ENV_URL, "")
+  dynatrace_platform_token  = try(local.dynatrace_secret.DYNATRACE_PLATFORM_TOKEN, "")
 }
