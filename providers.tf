@@ -22,7 +22,7 @@ terraform {
 }
 
 provider "dynatrace" {
-  dt_env_url    = local.dynatrace_environment_url
+  dt_env_url     = local.dynatrace_environment_url
   platform_token = local.dynatrace_platform_token
 }
 
