@@ -1,28 +1,54 @@
-## AWS account connections
+## AWS account monitoring
 
-This configuration creates one Dynatrace AWS connection and its AWS IAM role in the AWS account mapped to the Terraform Cloud workspace. It uses the official `hashicorp/aws` and `dynatrace-oss/dynatrace` providers and does not require AWS Organizations access. To onboard another account, use another Terraform Cloud workspace with that account's AWS credentials.
+This configuration creates a Clouds AWS monitoring connection, an IAM role, and a topology and metrics monitoring configuration for the AWS account mapped to the Terraform Cloud workspace. It uses the official `hashicorp/aws` and `dynatrace-oss/dynatrace` providers. The account ID is detected using `aws_caller_identity`; onboarding does not require AWS Organizations access.
 
-### Clouds v2 versus classic AWS monitoring
+### Authentication and monitoring
 
-The linked AWS onboarding documentation is the newer Clouds AWS connection model. For that model, use `dynatrace_aws_connection` together with `dynatrace_aws_connection_role_arn`, as implemented in `modules/aws-account/main.tf`.
+The module follows [Dynatrace's AWS monitoring onboarding guide](https://docs.dynatrace.com/docs/ingest-from/amazon-web-services/create-an-aws-connection/aws-connection-api):
 
-Do not replace those resources with `dynatrace_aws_credentials` for Clouds v2. `dynatrace_aws_credentials` manages the classic AWS credentials API and is a separate integration path. It will not create a native Clouds v2 connection managed by the Clouds app.
+- `dynatrace_aws_connection` uses `role_based_auth` with consumer `SVC:com.dynatrace.da`.
+- The IAM role trusts `arn:aws:iam::314146291599:root` for `sts:AssumeRole`, restricted by an external ID equal to the connection ID.
+- `dynatrace_aws_connection_role_arn` links the role after its policy attachment completes and retries for up to five minutes for IAM propagation.
+- `dynatrace_hub_extension_v2_config` enables the AWS extension's essential topology and metrics feature sets after the connection is ready. It reads the installed extension version instead of hardcoding one.
 
-The default AWS provider reads the JSON secret from Secrets Manager. It requires `secretsmanager:GetSecretValue` for the configured ARN. The secret must contain `DYNATRACE_ENV_URL` and `DYNATRACE_PLATFORM_TOKEN`; `DYNATRACE_HTTP_OAUTH_PREFERENCE` is not required when the provider is explicitly configured with `platform_token`.
+The module retains the AWS managed `ReadOnlyAccess` policy. This is broad; review it against your organization's policy standards. GovCloud and China partitions are not supported. Logs and events ingestion are not configured.
 
-The AWS credentials mapped to the workspace must be an administrator, or have permission to read the secret, create the OIDC provider, IAM role, policy attachment, and related IAM resources in that account. The Dynatrace platform token must have `settings.read` and `settings.write` scopes.
+This integration does not use the workflow consumer `APP:dynatrace.aws.connector` or its OIDC provider. `dynatrace_aws_credentials` is a separate, classic AWS monitoring integration.
 
-The connection name is generated as `aws-<account-id>`. The AWS Console account name shown in the billing or account menu is not exposed by the standard account-level AWS APIs, and an IAM account alias is optional, so this configuration does not depend on either value.
+### Prerequisites
 
-### Configure accounts
+Install the `com.dynatrace.extension.da-aws` extension in the Dynatrace environment before planning. For a first connection, open **Settings > Collect and capture > Cloud and virtualization > AWS** and leave it open for about ten minutes, as described in the onboarding guide. The active-version data source requires an installed extension.
 
-Create a `terraform.tfvars` file based on this example:
+The default AWS provider reads a JSON secret from Secrets Manager. The configured AWS credentials need `secretsmanager:GetSecretValue` on that secret and permissions to manage the IAM role and policy attachment. The secret must contain:
 
-```hcl
-aws_role_name = "DynatraceAwsMonitoringRole"
+- `DYNATRACE_ENV_URL`: the platform environment URL, such as `https://abc12345.apps.dynatrace.com`.
+- `DYNATRACE_PLATFORM_TOKEN`: a platform token whose service user can manage the AWS connection and extension configuration.
+
+The platform token needs these scopes, with matching permissions assigned to its service user:
+
+```text
+settings:objects:read
+settings:objects:write
+extensions:definitions:read
+extensions:configurations:read
+extensions:configurations:write
 ```
 
-Run Terraform with credentials that can access both profiles:
+The settings permissions must cover `builtin:hyperscaler-authentication.connections.aws`; the extension permissions must cover `com.dynatrace.extension.da-aws`. `settings.read` and `settings.write` are classic API-token scopes, not the platform-token scopes used here. The provider is configured explicitly with `platform_token`.
+
+### Configuration
+
+By default, monitoring covers `aws_region` (`eu-west-2`) and `us-east-1`. The latter is always included for global AWS resources. Override the monitored regions in workspace variables or `terraform.tfvars`:
+
+```hcl
+aws_role_name     = "DynatraceAwsMonitoringRole"
+aws_region        = "eu-west-2"
+monitored_regions = ["eu-west-2", "eu-west-1"]
+```
+
+Both topology and metrics use the same region list. The connection name is `aws-<account-id>`. Outputs expose the AWS account ID, role ARN, Dynatrace connection ID, and monitoring configuration ID.
+
+Authenticate to Terraform Cloud and provide the workspace with the target account's AWS credentials, then run:
 
 ```text
 terraform init
@@ -30,6 +56,23 @@ terraform plan
 terraform apply
 ```
 
-For another AWS account, create or reuse a Terraform Cloud workspace with AWS credentials for that account and use the same configuration. The account ID is detected automatically with `aws_caller_identity`; no Organization-level access or account ID variable is required.
+`aws_profile` is optional for local execution; leave it null when Terraform Cloud supplies AWS credentials. To onboard another account, change the workspace selected in `providers.tf` and configure that workspace with the other account's credentials and an accessible Dynatrace secret.
 
-The module attaches AWS managed `ReadOnlyAccess` because Dynatrace's AWS polling surface covers many AWS services. Review that choice against your organization's IAM policy standards before production use. GovCloud and China partitions are not supported by this Dynatrace connection model.
+### Migrating the failed OIDC configuration
+
+Run a full plan using the existing workspace and state. Switching authentication types replaces the Dynatrace connection, so its ID changes. Terraform updates the existing IAM role's trust policy with the new external ID, links the role, and creates the monitoring configuration. Any external references to the old connection ID must be updated.
+
+The obsolete `aws_iam_openid_connect_provider.dynatrace` is removed from this configuration and will be destroyed if it is in the workspace state. If other workflow roles use that provider, transfer its management to their Terraform configuration before applying this migration.
+
+The migration requires permission to delete the old IAM OIDC provider. Review the replacement and deletion in the plan. Increasing the old timeout or adding policy dependencies cannot repair the previous OIDC audience mismatch.
+
+### Local checks
+
+```text
+terraform fmt -check -recursive
+terraform validate
+terraform -chdir=modules/aws-account init -backend=false
+terraform -chdir=modules/aws-account test
+```
+
+Tests require Terraform 1.7 or later and use mocked AWS and Dynatrace providers; they do not provision infrastructure. They check the monitoring authentication, external-ID restriction, account binding, region handling, and account guard. A successful live apply is still required to verify tenant permissions and connectivity.

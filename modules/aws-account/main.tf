@@ -1,15 +1,10 @@
 data "aws_caller_identity" "current" {}
 
-resource "aws_iam_openid_connect_provider" "dynatrace" {
-  url            = "https://token.dynatrace.com"
-  client_id_list = ["${trimsuffix(var.dynatrace_environment_url, "/")}/app-id/dynatrace.aws.connector"]
-}
-
 resource "dynatrace_aws_connection" "this" {
   name = var.account_name
 
-  web_identity {
-    consumers = ["APP:dynatrace.aws.connector"]
+  role_based_auth {
+    consumers = ["SVC:com.dynatrace.da"]
   }
 }
 
@@ -18,22 +13,16 @@ data "aws_iam_policy_document" "assume_role" {
     effect = "Allow"
 
     principals {
-      type        = "Federated"
-      identifiers = [aws_iam_openid_connect_provider.dynatrace.arn]
+      type        = "AWS"
+      identifiers = ["arn:aws:iam::314146291599:root"]
     }
 
-    actions = ["sts:AssumeRoleWithWebIdentity"]
+    actions = ["sts:AssumeRole"]
 
     condition {
       test     = "StringEquals"
-      variable = "token.dynatrace.com:sub"
-      values   = ["dt:connection-id/${dynatrace_aws_connection.this.id}"]
-    }
-
-    condition {
-      test     = "StringEquals"
-      variable = "token.dynatrace.com:aud"
-      values   = ["${trimsuffix(var.dynatrace_environment_url, "/")}/app-id/dynatrace.aws.connector"]
+      variable = "sts:ExternalId"
+      values   = [dynatrace_aws_connection.this.id]
     }
   }
 }
@@ -58,6 +47,8 @@ resource "aws_iam_role_policy_attachment" "read_only" {
 resource "dynatrace_aws_connection_role_arn" "this" {
   aws_connection_id = dynatrace_aws_connection.this.id
   role_arn          = aws_iam_role.dynatrace.arn
+
+  depends_on = [aws_iam_role_policy_attachment.read_only]
 
   timeouts {
     create = "5m"
