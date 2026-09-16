@@ -9,3 +9,7 @@ output "aws_role_arn" {
 output "dynatrace_connection_id" {
   value = module.aws_account.dynatrace_connection_id
 }
+
+output "dynatrace_monitoring_configuration_id" {
+  value = module.aws_account.dynatrace_monitoring_configuration_id
+}

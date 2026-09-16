@@ -16,6 +16,12 @@ variable "aws_profile" {
   default     = null
 }
 
+variable "monitored_regions" {
+  description = "AWS regions to monitor; defaults to aws_region, with us-east-1 always added for global resources"
+  type        = set(string)
+  default     = null
+}
+
 variable "aws_role_name" {
   description = "IAM role name created in the current AWS account"
   type        = string
