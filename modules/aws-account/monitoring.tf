@@ -12,9 +12,11 @@ resource "dynatrace_hub_extension_v2_config" "aws" {
   name  = local.aws_extension_name
   scope = "integration-aws"
   value = jsonencode({
-    enabled     = true
-    description = var.account_name
-    version     = data.dynatrace_hub_extension_v2_active_version.aws.active_version
+    # Match defaults returned by Dynatrace to avoid recurring plan differences.
+    activationContext = "DATA_ACQUISITION"
+    enabled           = true
+    description       = var.account_name
+    version           = data.dynatrace_hub_extension_v2_active_version.aws.active_version
     featureSets = [
       "ApplicationELB_essential",
       "AutoScaling_essential",
@@ -32,6 +34,9 @@ resource "dynatrace_hub_extension_v2_config" "aws" {
       "SQS_essential",
     ]
     aws = {
+      namespaces       = []
+      tagEnrichment    = []
+      tagFiltering     = []
       deploymentRegion = var.deployment_region
       credentials = [{
         enabled      = true
