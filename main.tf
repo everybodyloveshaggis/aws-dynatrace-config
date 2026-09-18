@@ -1,7 +1,7 @@
 data "aws_caller_identity" "current" {}
 
 module "aws_account" {
-  source = "./modules/aws-account"
+  source = "./modules/application"
 
   providers = {
     aws       = aws

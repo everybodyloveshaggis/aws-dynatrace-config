@@ -51,6 +51,6 @@ resource "dynatrace_aws_connection_role_arn" "this" {
   depends_on = [aws_iam_role_policy_attachment.read_only]
 
   timeouts {
-    create = "5m"
+    create = "2m"
   }
 }

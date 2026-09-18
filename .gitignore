@@ -16,6 +16,12 @@ crash.*.log
 *.tfvars
 *.tfvars.json
 
+# This file contains secret ARNs only and is required by CI/Terraform Cloud.
+!secrets.auto.tfvars
+
+# Local Python test artifacts
+__pycache__/
+
 # Ignore override files as they are usually used to override resources locally and so
 # are not checked in
 override.tf
