@@ -1,7 +1,12 @@
 variable "dynatrace_secret_arn" {
   description = "ARN of the Secrets Manager secret containing Dynatrace credentials"
   type        = string
-  default     = "arn:aws:secretsmanager:eu-west-2:899045892145:secret:dynatrace-secrets-sPjhXs"
+  nullable    = false
+
+  validation {
+    condition     = can(regex("^arn:aws:secretsmanager:[a-z0-9-]+:[0-9]{12}:secret:.+$", var.dynatrace_secret_arn))
+    error_message = "dynatrace_secret_arn must be an AWS Secrets Manager secret ARN."
+  }
 }
 
 variable "aws_region" {
