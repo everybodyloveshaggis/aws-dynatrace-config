@@ -1,7 +1,4 @@
-locals {
-  aws_extension_name = "com.dynatrace.extension.da-aws"
-  monitored_regions  = sort(tolist(setunion(var.monitored_regions, ["us-east-1"])))
-}
+
 
 # The AWS extension must already be installed in the Dynatrace environment.
 data "dynatrace_hub_extension_v2_active_version" "aws" {
