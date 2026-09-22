@@ -1,6 +1,10 @@
 ## AWS account monitoring
 
-This configuration creates a Clouds AWS monitoring connection, an IAM role, and a topology and metrics monitoring configuration for the AWS account mapped to the Terraform Cloud workspace. It uses the official `hashicorp/aws` and `dynatrace-oss/dynatrace` providers. The account ID is detected using `aws_caller_identity`; onboarding does not require AWS Organizations access.
+This configuration creates a Clouds AWS monitoring connection, an IAM role, and a topology and metrics monitoring configuration for the AWS account mapped to the Terraform Cloud workspace. It can optionally stream all CloudWatch log groups in the configured AWS region to Dynatrace through Amazon Data Firehose. It uses the official `hashicorp/aws` and `dynatrace-oss/dynatrace` providers. The account ID is detected using `aws_caller_identity`; onboarding does not require AWS Organizations access.
+
+- `modules/application` contains only Dynatrace provider resources: the connection, role association, and monitoring settings.
+- `modules/infrastructure` contains only AWS provider resources: the monitoring IAM role and optional Firehose, subscription, IAM, S3 backup, and delivery diagnostics.
+- The root configures providers and credentials and connects the modules. The connection ID becomes the AWS role's external ID; the role ARN returns to the application after its policy is attached. Avoid module-wide `depends_on` between these modules, which would create a dependency cycle.
 
 ### Authentication and monitoring
 
@@ -8,10 +12,10 @@ The module follows [Dynatrace's AWS monitoring onboarding guide](https://docs.dy
 
 - `dynatrace_aws_connection` uses `role_based_auth` with consumer `SVC:com.dynatrace.da`.
 - The IAM role trusts `arn:aws:iam::314146291599:root` for `sts:AssumeRole`, restricted by an external ID equal to the connection ID.
-- `dynatrace_aws_connection_role_arn` links the role after its policy attachment completes and retries for up to five minutes for IAM propagation.
+- `dynatrace_aws_connection_role_arn` links the role after its policy attachment completes and retries for up to two minutes for IAM propagation.
 - `dynatrace_hub_extension_v2_config` enables the AWS extension's essential topology and metrics feature sets after the connection is ready. It reads the installed extension version instead of hardcoding one.
 
-The module retains the AWS managed `ReadOnlyAccess` policy. This is broad; review it against your organization's policy standards. GovCloud and China partitions are not supported. Logs and events ingestion are not configured.
+The infrastructure module retains the AWS managed `ReadOnlyAccess` policy. This is broad; review it against your organization's policy standards. GovCloud and China partitions are not supported. Log forwarding is disabled by default; events ingestion is not configured.
 
 This integration does not use the workflow consumer `APP:dynatrace.aws.connector` or its OIDC provider. `dynatrace_aws_credentials` is a separate, classic AWS monitoring integration.
 
@@ -62,6 +66,50 @@ monitored_regions = ["eu-west-2", "eu-west-1"]
 
 Both topology and metrics use the same region list. The connection name is `aws-<account-id>`. Outputs expose the AWS account ID, role ARN, Dynatrace connection ID, and monitoring configuration ID.
 
+### Optional CloudWatch log forwarding
+
+Leave `cloudwatch_logs` unset (or set it to `null`) for accounts without Firehose. Enable it per account with the following Terraform variable. The values below are examples; use your environment's actual ingest endpoint and secret ARN:
+
+```hcl
+cloudwatch_logs = {
+  endpoint_url = "https://abc12345.live.dynatrace.com/api/v2/logs/ingest/aws_firehose"
+  secret_arn   = "arn:aws:secretsmanager:eu-west-2:123456789012:secret:dynatrace-log-ingest-AbCdEf"
+
+  # Optional defaults:
+  # name                  = "dynatrace-cloudwatch-logs"
+  # backup_retention_days = 30
+  # secret_kms_key_arn     = "arn:aws:kms:eu-west-2:123456789012:key/..."
+}
+```
+
+Store this non-secret configuration in a version-controlled account `.auto.tfvars` file (add a specific `.gitignore` exception for that file), or in the account's Terraform Cloud workspace as an HCL variable. The existing checked-in account configuration leaves log forwarding disabled. No token value belongs in tfvars.
+
+The referenced secret must already exist in the forwarding account and `aws_region`. Its JSON must contain `{"api_key":"<Dynatrace API token with logs.ingest permission>"}`. This is a log ingestion credential, separate from the platform token used to manage Dynatrace settings. Firehose reads the secret itself at runtime; Terraform only stores its ARN, never fetches its value, and does not populate Firehose's state-backed `access_key` argument. If the secret uses a customer-managed KMS key, supply `secret_kms_key_arn` and ensure that key's policy permits the delivery role to decrypt it. Back up or securely restore the ingestion secret as part of disaster recovery.
+
+Use the full Firehose ingestion endpoint, normally on `live.dynatrace.com`, rather than the `apps.dynatrace.com` URL used by the Dynatrace provider. See [Dynatrace's Firehose setup](https://docs.dynatrace.com/docs/ingest-from/amazon-web-services/integrate-with-aws/aws-logs-ingest/lma-stream-logs-with-firehose) and [AWS's required secret format](https://docs.aws.amazon.com/firehose/latest/dev/secrets-manager-whats-secret.html).
+
+Enabling this option creates:
+
+- A Firehose stream delivering directly to Dynatrace with GZIP HTTP requests, a 1 MiB / 60 second buffer, and 900 seconds of delivery retries. The CloudWatch envelope remains intact for Dynatrace to decode.
+- An encrypted, private S3 bucket for failed deliveries, expiring them after 30 days by default.
+- IAM roles restricted to this account's CloudWatch Logs, the delivery stream, backup bucket, and ingestion secret.
+- An account-level subscription with an empty event filter. It includes all existing and future subscription-capable CloudWatch log groups in `aws_region`, including CloudTrail and VPC flow logs. The stream's own diagnostic log group is the sole exclusion, preventing recursive delivery.
+- The Dynatrace extension's `cloudWatchLogsConfiguration`, enabled for `aws_region` only after the subscription is ready. Deployment remains `MANUAL`; Terraform manages the resources directly without CloudFormation stacks.
+
+Log forwarding is regional. `monitored_regions` controls topology and metrics only; adding regions there does not deploy additional Firehose streams. CloudWatch subscriptions support the Standard log class and forward new events, not historical log contents. An account can have only one account-level subscription policy per region; an existing one must be reconciled or imported before applying this configuration. Existing log-group subscriptions are additive and can cause duplicate delivery if they already forward to Dynatrace. See [AWS subscription documentation](https://docs.aws.amazon.com/AmazonCloudWatch/latest/logs/Subscriptions.html) and [recursion prevention](https://docs.aws.amazon.com/AmazonCloudWatch/latest/logs/Subscriptions-recursion-prevention.html).
+
+The Terraform run role needs permissions to manage Firehose, the backup S3 bucket and its configuration, CloudWatch log groups/streams/account policies, and the new IAM roles/inline policies, including `iam:PassRole`. The Firehose delivery role receives `secretsmanager:GetSecretValue` on the ingestion secret. The runner does not need to read that ingestion token.
+
+Outputs `cloudwatch_logs_firehose_arn` and `cloudwatch_logs_backup_bucket` identify the stream and failed-delivery bucket; both are null when disabled. After applying, produce a new log event in a Standard log group, check Firehose's delivery metrics and diagnostic log stream, and confirm the event appears in Dynatrace. Creating a new group should require no further Terraform run.
+
+Setting `cloudwatch_logs = null` removes the forwarding resources and disables the Dynatrace log setting. The backup bucket deliberately has `force_destroy = false`: if failed deliveries exist, recover or explicitly dispose of them before removing the bucket. Do not treat this bucket as a permanent log archive; it contains failures only and has the configured retention period.
+
+### Migrating the module split
+
+Keep the existing workspace and state and run a normal plan. `moved.tf` maps all five existing managed resources from `module.aws_account` to `module.application` or `module.infrastructure`, preserving their remote identities. With log forwarding disabled, the split should not replace the monitoring IAM role or Dynatrace connection. Keep these move declarations until every account's state has migrated. The application module now takes `role_arn`; standalone consumers must create the AWS infrastructure separately.
+
+### Deploying
+
 Authenticate to Terraform Cloud, retain the workspace's AWS dynamic credentials setup, and run:
 
 ```text
@@ -93,8 +141,10 @@ terraform fmt -check -recursive
 terraform validate
 terraform -chdir=modules/application init -backend=false
 terraform -chdir=modules/application test
+terraform -chdir=modules/infrastructure init -backend=false
+terraform -chdir=modules/infrastructure test
 ```
 
-Tests require Terraform 1.7 or later and use mocked AWS and Dynatrace providers; they do not provision infrastructure. They check the monitoring authentication, external-ID restriction, account binding, region handling, and account guard. A successful live apply is still required to verify tenant permissions and connectivity.
+Use the same Terraform 1.10+ version as the root configuration. Tests use mocked AWS and Dynatrace providers; they do not provision infrastructure. They check monitoring authentication, external-ID restrictions, account binding, region handling, the account guard, optional log resources, account-wide subscription coverage, recursion prevention, runtime secret references, and Dynatrace log settings. A successful live apply is still required to verify tenant permissions and connectivity.
 
 For secret handling, run `python3 -m unittest discover -s tests -p 'test_*.py' -v` with Terraform 1.10+ and Python 3 installed. These tests use the locked AWS provider against a local HTTP stub with synthetic credentials. They check malformed-secret rejection and verify that fetched credentials reach provider configuration but do not appear in state or saved plan contents. They use an isolated local backend and do not contact AWS, Dynatrace, or Terraform Cloud.

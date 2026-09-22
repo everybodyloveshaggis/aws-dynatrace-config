@@ -13,10 +13,15 @@ variable "account_id" {
   }
 }
 
-variable "role_name" {
-  description = "IAM role assumed by Dynatrace"
+variable "role_arn" {
+  description = "ARN of the AWS monitoring role, supplied after its policy attachment is ready"
   type        = string
-  default     = "DynatraceAwsMonitoringRole"
+}
+
+variable "cloudwatch_logs_regions" {
+  description = "Regions with Terraform-managed CloudWatch log forwarding ready for ingestion"
+  type        = set(string)
+  default     = []
 }
 
 variable "deployment_region" {

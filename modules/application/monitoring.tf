@@ -47,8 +47,8 @@ resource "dynatrace_hub_extension_v2_config" "aws" {
         regions = local.monitored_regions
       }
       cloudWatchLogsConfiguration = {
-        enabled = false
-        regions = []
+        enabled = length(var.cloudwatch_logs_regions) > 0
+        regions = sort(tolist(var.cloudwatch_logs_regions))
       }
       configurationMode         = "QUICK_START"
       deploymentScope           = "SINGLE_ACCOUNT"

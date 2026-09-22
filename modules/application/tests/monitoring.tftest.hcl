@@ -1,18 +1,4 @@
-mock_provider "aws" {
-  # Keep the mocked JSON valid for the IAM role's provider-side validation.
-  # The assertions below inspect the configured trust statements themselves.
-  mock_data "aws_iam_policy_document" {
-    defaults = {
-      json = "{}"
-    }
-  }
 
-  mock_data "aws_caller_identity" {
-    defaults = {
-      account_id = "123456789012"
-    }
-  }
-}
 
 mock_provider "dynatrace" {
   mock_data "dynatrace_hub_extension_v2_active_version" {
@@ -23,6 +9,7 @@ mock_provider "dynatrace" {
 }
 
 variables {
+  role_arn          = "arn:aws:iam::123456789012:role/DynatraceAwsMonitoringRole"
   account_name      = "aws-123456789012"
   account_id        = "123456789012"
   deployment_region = "eu-west-2"
@@ -33,21 +20,20 @@ run "monitoring_connection" {
   command = apply
 
   assert {
+    condition = (
+      dynatrace_aws_connection_role_arn.this.role_arn == var.role_arn &&
+      !jsondecode(dynatrace_hub_extension_v2_config.aws.value).aws.cloudWatchLogsConfiguration.enabled &&
+      length(jsondecode(dynatrace_hub_extension_v2_config.aws.value).aws.cloudWatchLogsConfiguration.regions) == 0
+    )
+    error_message = "The application must link the supplied AWS role and disable logs by default."
+  }
+
+  assert {
     condition     = dynatrace_aws_connection.this.role_based_auth[0].consumers == toset(["SVC:com.dynatrace.da"]) && length(dynatrace_aws_connection.this.web_identity) == 0
     error_message = "Monitoring must use the data acquisition service and cross-account authentication."
   }
 
-  assert {
-    condition = (
-      data.aws_iam_policy_document.assume_role.statement[0].actions == toset(["sts:AssumeRole"]) &&
-      one(data.aws_iam_policy_document.assume_role.statement[0].principals).type == "AWS" &&
-      one(data.aws_iam_policy_document.assume_role.statement[0].principals).identifiers == toset(["arn:aws:iam::314146291599:root"]) &&
-      one(data.aws_iam_policy_document.assume_role.statement[0].condition).test == "StringEquals" &&
-      one(data.aws_iam_policy_document.assume_role.statement[0].condition).variable == "sts:ExternalId" &&
-      toset(one(data.aws_iam_policy_document.assume_role.statement[0].condition).values) == toset([dynatrace_aws_connection.this.id])
-    )
-    error_message = "Trust must be restricted to the Dynatrace AWS principal and this connection's external ID."
-  }
+
 
   assert {
     condition = (
@@ -75,15 +61,6 @@ run "custom_regions" {
   }
 }
 
-run "reject_wrong_account" {
-  command = plan
-
-  variables {
-    account_id = "999999999999"
-  }
-
-  expect_failures = [aws_iam_role.dynatrace]
-}
 
 run "reject_empty_regions" {
   command = plan
@@ -93,4 +70,21 @@ run "reject_empty_regions" {
   }
 
   expect_failures = [var.monitored_regions]
+}
+
+run "cloudwatch_logs_enabled" {
+  command = plan
+
+  variables {
+    cloudwatch_logs_regions = ["eu-west-2"]
+  }
+
+  assert {
+    condition = (
+      jsondecode(dynatrace_hub_extension_v2_config.aws.value).aws.cloudWatchLogsConfiguration.enabled &&
+      jsondecode(dynatrace_hub_extension_v2_config.aws.value).aws.cloudWatchLogsConfiguration.regions == ["eu-west-2"] &&
+      jsondecode(dynatrace_hub_extension_v2_config.aws.value).aws.deploymentMode == "MANUAL"
+    )
+    error_message = "Logs must be enabled only in regions where Terraform deploys forwarding, without automated CloudFormation deployment."
+  }
 }
