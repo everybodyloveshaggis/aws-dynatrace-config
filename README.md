@@ -54,9 +54,9 @@ Set the secret ARN in the checked-in `secrets.auto.tfvars` file. It contains onl
 dynatrace_secret_arn = "arn:aws:secretsmanager:eu-west-2:899045892145:secret:dynatrace-secrets-sPjhXs"
 ```
 
-Terraform Cloud automatically loads this file with the configuration; no new workspace variable is needed. The `.gitignore` exception permits this specific ARN-only file while continuing to ignore other tfvars files. Keep the existing TFC AWS authentication settings. If `dynatrace_secret_arn` is already set as a workspace variable, that value takes precedence over the file.
+Terraform Cloud automatically loads this file with the configuration; no new workspace variable is needed. The `.gitignore` exceptions permit this ARN-only file and the non-secret `account.auto.tfvars` file while continuing to ignore other tfvars files. Reserve Terraform Cloud workspace variables for TFC-to-AWS role authentication only. Keep all other configuration in the checked-in tfvars files. Remove any existing non-authentication workspace variables after transferring their values to these files, because workspace variables take precedence.
 
-By default, monitoring covers `aws_region` (`eu-west-2`) and `us-east-1`. The latter is always included for global AWS resources. Override the monitored regions in workspace variables or `terraform.tfvars`:
+By default, monitoring covers `aws_region` (`eu-west-2`) and `us-east-1`. The latter is always included for global AWS resources. Configure the region and any monitoring overrides in `account.auto.tfvars`:
 
 ```hcl
 aws_role_name     = "DynatraceAwsMonitoringRole"
@@ -82,7 +82,7 @@ cloudwatch_logs = {
 }
 ```
 
-Store this non-secret configuration in a version-controlled account `.auto.tfvars` file (add a specific `.gitignore` exception for that file), or in the account's Terraform Cloud workspace as an HCL variable. The existing checked-in account configuration leaves log forwarding disabled. No token value belongs in tfvars.
+Set this non-secret configuration in the checked-in `account.auto.tfvars` file, which Terraform Cloud loads automatically. Replace its `cloudwatch_logs = null` assignment with the object above using your actual endpoint and secret ARN; a commented template is included in the file. The `.gitignore` already permits this specific file. Log forwarding remains disabled until those values are supplied. Do not create a Terraform Cloud workspace variable for this configuration. No token value belongs in tfvars.
 
 The referenced secret must already exist in the forwarding account and `aws_region`. Its JSON must contain `{"api_key":"<Dynatrace API token with logs.ingest permission>"}`. This is a log ingestion credential, separate from the platform token used to manage Dynatrace settings. Firehose reads the secret itself at runtime; Terraform only stores its ARN, never fetches its value, and does not populate Firehose's state-backed `access_key` argument. If the secret uses a customer-managed KMS key, supply `secret_kms_key_arn` and ensure that key's policy permits the delivery role to decrypt it. Back up or securely restore the ingestion secret as part of disaster recovery.
 
@@ -99,6 +99,8 @@ Enabling this option creates:
 Log forwarding is regional. `monitored_regions` controls topology and metrics only; adding regions there does not deploy additional Firehose streams. CloudWatch subscriptions support the Standard log class and forward new events, not historical log contents. An account can have only one account-level subscription policy per region; an existing one must be reconciled or imported before applying this configuration. Existing log-group subscriptions are additive and can cause duplicate delivery if they already forward to Dynatrace. See [AWS subscription documentation](https://docs.aws.amazon.com/AmazonCloudWatch/latest/logs/Subscriptions.html) and [recursion prevention](https://docs.aws.amazon.com/AmazonCloudWatch/latest/logs/Subscriptions-recursion-prevention.html).
 
 The Terraform run role needs permissions to manage Firehose, the backup S3 bucket and its configuration, CloudWatch log groups/streams/account policies, and the new IAM roles/inline policies, including `iam:PassRole`. The Firehose delivery role receives `secretsmanager:GetSecretValue` on the ingestion secret. The runner does not need to read that ingestion token.
+
+Terraform waits 60 seconds after creating or changing the CloudWatch delivery role's permissions before configuring the account-level subscription. This mitigates IAM propagation errors during CloudWatch's Firehose test delivery. Unchanged applies do not repeat the wait. AWS propagation can occasionally take longer, so a delayed retry may still be necessary.
 
 Outputs `cloudwatch_logs_firehose_arn` and `cloudwatch_logs_backup_bucket` identify the stream and failed-delivery bucket; both are null when disabled. After applying, produce a new log event in a Standard log group, check Firehose's delivery metrics and diagnostic log stream, and confirm the event appears in Dynatrace. Creating a new group should require no further Terraform run.
 

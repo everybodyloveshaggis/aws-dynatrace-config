@@ -19,6 +19,9 @@ crash.*.log
 # This file contains secret ARNs only and is required by CI/Terraform Cloud.
 !secrets.auto.tfvars
 
+# Non-secret account monitoring and Firehose configuration.
+!account.auto.tfvars
+
 # Local Python test artifacts
 __pycache__/
 

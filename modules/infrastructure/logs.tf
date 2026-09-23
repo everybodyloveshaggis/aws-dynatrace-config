@@ -232,6 +232,20 @@ resource "aws_iam_role_policy" "cloudwatch_logs" {
   })
 }
 
+# IAM writes can complete before CloudWatch can use the new permissions.
+# Repeat the wait when the role, trust, or delivery policy changes.
+resource "time_sleep" "cloudwatch_logs_iam" {
+  for_each = local.log_forwarding
+
+  create_duration = "60s"
+  triggers = {
+    role_unique_id = aws_iam_role.cloudwatch_logs[each.key].unique_id
+    trust_policy   = aws_iam_role.cloudwatch_logs[each.key].assume_role_policy
+    policy_id      = aws_iam_role_policy.cloudwatch_logs[each.key].id
+    policy         = aws_iam_role_policy.cloudwatch_logs[each.key].policy
+  }
+}
+
 resource "aws_cloudwatch_log_account_policy" "dynatrace" {
   for_each = local.log_forwarding
 
@@ -248,5 +262,5 @@ resource "aws_cloudwatch_log_account_policy" "dynatrace" {
   # Exclude only the delivery stream's own diagnostics to prevent recursion.
   selection_criteria = "LogGroupName NOT IN ${jsonencode([aws_cloudwatch_log_group.firehose[each.key].name])}"
 
-  depends_on = [aws_iam_role_policy.cloudwatch_logs]
+  depends_on = [time_sleep.cloudwatch_logs_iam]
 }
