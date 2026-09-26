@@ -17,10 +17,13 @@ import unittest
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from zipfile import ZipFile
 
+from terraform_test_support import without_cloud_backend
+
 
 ROOT = Path(__file__).resolve().parents[1]
 APPLICATION = ROOT / "terraform" / "components" / "application"
 TOKEN = "test-only-dynatrace-token-must-not-persist"
+CLASSIC_TOKEN = "test-only-dynatrace-classic-token-must-not-persist"
 ARN = "arn:aws:secretsmanager:eu-west-2:123456789012:secret:test-AbCdEf"
 
 
@@ -68,11 +71,8 @@ class SecretHandlingTest(unittest.TestCase):
         cls.thread.start()
         for name in ("providers.tf", "versions.tf", "variables.tf", "secrets.tf", ".terraform.lock.hcl"):
             shutil.copy2(APPLICATION / name, cls.work / name)
-        versions = (cls.work / "versions.tf").read_text()
-        versions, removed = re.subn(r'\n  cloud\s*\{\s*\}\n', "\n", versions, count=1)
-        if removed != 1:
-            raise AssertionError("Could not isolate the test from Terraform Cloud")
-        (cls.work / "versions.tf").write_text(versions)
+        versions = cls.work / "versions.tf"
+        versions.write_text(without_cloud_backend(versions.read_text()))
         # Isolate the actual secret locals from unrelated SSM account routing.
         secret_locals = [line for line in (APPLICATION / "locals.tf").read_text().splitlines()
                          if re.match(r"\s*dynatrace_(secret|environment_url|platform_token)\s*=", line)]
@@ -143,9 +143,10 @@ class SecretHandlingTest(unittest.TestCase):
 
     def test_valid_secret_is_used_but_not_persisted(self):
         type(self).payload = json.dumps({"DYNATRACE_ENV_URL": "https://example.apps.dynatrace.com",
-                                        "DYNATRACE_PLATFORM_TOKEN": TOKEN})
+                                        "DYNATRACE_PLATFORM_TOKEN": TOKEN,
+                                        "DYNATRACE_API_TOKEN": CLASSIC_TOKEN})
         self.received_tokens.clear()
-        result = self.run_tf("plan", "-input=false", "-out=test.tfplan")
+        result = self.run_tf("plan", "-input=false", "-out=test.tfplan", "-var=aws_extension_version=1.0.5")
         self.assertEqual(result.returncode, 0, result.stdout)
         self.assertIn(TOKEN, self.received_tokens)
         with ZipFile(self.work / "test.tfplan") as plan:
@@ -154,7 +155,7 @@ class SecretHandlingTest(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stdout)
         artifacts.append((self.work / "terraform.tfstate").read_bytes())
         for artifact in artifacts:
-            for secret in (TOKEN, self.env["AWS_SECRET_ACCESS_KEY"]):
+            for secret in (TOKEN, CLASSIC_TOKEN, self.env["AWS_SECRET_ACCESS_KEY"]):
                 self.assertNotIn(secret.encode(), artifact)
         state = json.loads((self.work / "terraform.tfstate").read_text())
         self.assertEqual(state["outputs"]["secret_arn"]["value"], ARN)

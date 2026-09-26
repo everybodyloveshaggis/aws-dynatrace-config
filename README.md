@@ -18,19 +18,23 @@ aws-dynatrace-iam/                    # Separate sibling Git repository
 
 All three application workspaces use `terraform/components/application` as their Terraform working directory. Include the repository's `terraform/modules` directory in the uploaded/VCS configuration. Use Terraform **1.10 or later** (CI uses 1.15.6).
 
+Set **Settings → General → Terraform Working Directory** to exactly `terraform/components/application` in each HCP workspace and save it before the first remote plan. This is an HCP workspace setting: neither `TF_WORKSPACE`, the `cloud` block nor `-chdir` sets it. Workspaces created automatically by `terraform init` initially have an empty working directory.
+
+With this setting, running from the application directory makes Terraform upload the repository root, including `terraform/modules`. If it is empty, only the application directory is uploaded and remote initialization fails with `lstat ../../modules: no such file or directory`. See [HashiCorp's parent-directory upload behavior](https://developer.hashicorp.com/terraform/cloud-docs/workspaces/settings#parent-directory-uploads). The same setting is required for the CLI-based GitHub workflows.
+
 | TFC workspace | Terraform variable `environment` | Accounts |
 | --- | --- | --- |
 | `dynatrace-dev-application` | `dev` | `/arecps/dynatrace/dev_accounts` |
 | `dynatrace-tst-application` | `tst` | `/arecps/dynatrace/tst_accounts` |
 | `dynatrace-prd-application` | `prd` | All accounts minus dev and tst |
 
-`account_ids_ssm_path` identifies the complete inventory. All three parameters must exist in the runner's AWS account and `aws_region`, using SSM `String` or `StringList` values. Values are comma-separated 12-digit IDs. Whitespace, duplicate IDs and empty CSV entries are discarded. For an empty classification, a String containing a space can represent an empty list. Dev/tst overlaps, malformed IDs and non-production accounts missing from the full inventory fail the plan. Each workspace creates resources only for its own environment.
+`account_ids_ssm_path` identifies the complete inventory and defaults to `/arecps/accounts/all_account_ids`. All three parameters must exist in the runner's AWS account and `aws_region`, using SSM `String` or `StringList` values. Values are comma-separated 12-digit IDs. Whitespace, duplicate IDs and empty CSV entries are discarded. For an empty classification, a String containing a space can represent an empty list. Dev/tst overlaps, malformed IDs and non-production accounts missing from the full inventory fail the plan. Each workspace creates resources only for its own environment.
 
 The application runner needs `ssm:GetParameter` on the three parameters and `secretsmanager:GetSecretValue` on its tenant secret (plus `kms:Decrypt` if required). It does not assume roles into monitored accounts or manage AWS resources. Keep TFC AWS dynamic credentials for the runner; configure a separate AWS run role in each IAM workspace.
 
 ## Tenant credentials and extension
 
-Set the inputs shown in [terraform.tfvars.example](terraform/components/application/terraform.tfvars.example) separately in each application workspace. Required inputs: `environment`, `account_ids_ssm_path`, `dynatrace_environment_id`, `dynatrace_secret_arn`.
+Set inputs in `terraform/components/application/env/<environment>.tfvars`, following [env/prd.tfvars](terraform/components/application/env/prd.tfvars), or configure them as HCP workspace Terraform variables. Required inputs: `environment`, `dynatrace_environment_id`, `dynatrace_secret_arn`. Override `account_ids_ssm_path` if the default inventory path differs. Environment files contain configuration and secret ARNs only; token values stay in Secrets Manager.
 
 The secret's JSON contains:
 
@@ -86,15 +90,21 @@ Monitoring includes `us-east-1` for global services and the configured regions. 
 
 ## CLI and checks
 
-For CLI use, set `TF_CLOUD_ORGANIZATION` and `TF_WORKSPACE=dynatrace-dev-application` (or tst/prd), authenticate to TFC and run:
+The cloud block selects your TFC organization `smdevops96_org`. For CLI use, set `TF_WORKSPACE=dynatrace-dev-application` (or tst/prd), authenticate to TFC and run:
 
 ```sh
 terraform -chdir=terraform/components/application init
-terraform -chdir=terraform/components/application plan
-terraform -chdir=terraform/components/application apply
+terraform -chdir=terraform/components/application plan -var-file=env/dev.tfvars
+terraform -chdir=terraform/components/application apply -var-file=env/dev.tfvars
 ```
 
-GitHub plan/apply workflows run all three workspaces. Configure repository variable `TF_CLOUD_ORGANIZATION` and secret `TF_API_TOKEN`; tenant inputs belong in each TFC workspace. Keep the repository root as the upload context and configure the working directory so sibling modules are included. The original push-to-main apply behavior is retained.
+Use the matching file for the selected workspace (`env/prd.tfvars` for production). If that environment uses HCP workspace variables instead, omit `-var-file`.
+
+GitHub plan/apply workflows run all three workspaces. After checkout, each job selects `env/<matrix environment>.tfvars` and passes it through `-var-file` to both plan and apply if the file exists. With no matching file, the job uses its HCP workspace variables and `TF_VAR_environment`. Only `prd.tfvars` is currently supplied; add dev/tst files when their file-based configuration is ready. Git allows these three named files, so commit and push them along with the workflow changes for GitHub Actions to read them.
+
+Configure repository secret `TF_API_TOKEN`. Keep the repository root as the upload context and configure the HCP working directory so sibling modules are included. The original push-to-main apply behavior is retained. Direct runs started by HCP VCS/UI do not execute these GitHub steps and do not automatically load files under `env`; those runs need workspace variables or their own explicit variable-file selection.
+
+For the CLI-driven workflows here, explicit `-var-file` values override ordinary workspace Terraform variables; priority variable sets can still override them. See [HCP variable precedence](https://developer.hashicorp.com/terraform/cloud-docs/variables#precedence). Keep `environment` in each file consistent with its workspace; the existing routing guard rejects a mismatch.
 
 Credential-free checks:
 

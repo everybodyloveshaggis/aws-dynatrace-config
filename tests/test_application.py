@@ -15,6 +15,8 @@ import tempfile
 import threading
 import unittest
 
+from terraform_test_support import without_cloud_backend
+
 
 ROOT = Path(__file__).resolve().parents[1]
 APPLICATION = ROOT / "terraform" / "components" / "application"
@@ -42,6 +44,7 @@ class ApplicationTest(unittest.TestCase):
                     "SecretString": json.dumps({
                         "DYNATRACE_ENV_URL": "https://example.apps.dynatrace.com",
                         "DYNATRACE_PLATFORM_TOKEN": "test-only-platform-token",
+                        "DYNATRACE_API_TOKEN": "test-only-classic-token",
                     }),
                     "VersionStages": ["AWSCURRENT"],
                     "CreatedDate": 1700000000,
@@ -57,10 +60,8 @@ class ApplicationTest(unittest.TestCase):
             shutil.copytree(APPLICATION, work, ignore=shutil.ignore_patterns(".terraform", "*.tfstate*", "*.tfvars", "*.tfvars.json"))
             shutil.copytree(ROOT / "terraform" / "modules", sandbox / "terraform" / "modules",
                             ignore=shutil.ignore_patterns(".terraform", "*.tfstate*"))
-            versions = (work / "versions.tf").read_text()
-            versions, removed = re.subn(r'\n  cloud\s*\{\s*\}\n', "\n", versions, count=1)
-            self.assertEqual(removed, 1, "Could not isolate the test from Terraform Cloud")
-            (work / "versions.tf").write_text(versions)
+            versions = work / "versions.tf"
+            versions.write_text(without_cloud_backend(versions.read_text()))
             env = {key: value for key, value in os.environ.items()
                    if not key.startswith(("AWS_", "TF_", "DYNATRACE_"))}
             env.update({
@@ -93,7 +94,7 @@ class ApplicationTest(unittest.TestCase):
                 self.assertEqual(replaced, 1, "Could not set the local Secrets Manager endpoint")
                 routing_test.write_text(test_config)
                 output = terraform("test", "-filter=tests/routing.tftest.hcl")
-                self.assertIn("11 passed, 0 failed", output)
+                self.assertIn("12 passed, 0 failed", output)
                 self.assertGreater(len(requests), 0, "The aliased ephemeral provider did not read the secret")
             finally:
                 server.shutdown()

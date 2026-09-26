@@ -22,7 +22,6 @@ jobs:
       cancel-in-progress: false
     env:
       TF_IN_AUTOMATION: "true"
-      TF_CLOUD_ORGANIZATION: ${{ vars.TF_CLOUD_ORGANIZATION }}
       TF_WORKSPACE: dynatrace-${{ matrix.environment }}-application
       TF_VAR_environment: ${{ matrix.environment }}
     defaults:
@@ -40,7 +39,25 @@ jobs:
       - name: Terraform Init
         run: terraform -chdir=terraform/components/application init -input=false
       - name: Terraform Plan
-        run: terraform -chdir=terraform/components/application plan -input=false
+        run: |
+          var_file="env/${TF_VAR_environment}.tfvars"
+          args=()
+          if [[ -f "terraform/components/application/${var_file}" ]]; then
+            args+=("-var-file=${var_file}")
+            echo "Using ${var_file}"
+          else
+            echo "No ${var_file}; using HCP workspace variables."
+          fi
+          terraform -chdir=terraform/components/application plan -input=false "${args[@]}"
       - name: Terraform Apply
         if: github.ref == 'refs/heads/main' && github.event_name == 'push'
-        run: terraform -chdir=terraform/components/application apply -auto-approve -input=false
+        run: |
+          var_file="env/${TF_VAR_environment}.tfvars"
+          args=()
+          if [[ -f "terraform/components/application/${var_file}" ]]; then
+            args+=("-var-file=${var_file}")
+            echo "Using ${var_file}"
+          else
+            echo "No ${var_file}; using HCP workspace variables."
+          fi
+          terraform -chdir=terraform/components/application apply -auto-approve -input=false "${args[@]}"
