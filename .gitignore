@@ -16,11 +16,18 @@ crash.*.log
 *.tfvars
 *.tfvars.json
 
-# This file contains secret ARNs only and is required by CI/Terraform Cloud.
-!secrets.auto.tfvars
+# These reviewed environment files contain configuration and secret ARNs only.
+!/terraform/components/application/env/dev.tfvars
+!/terraform/components/application/env/tst.tfvars
+!/terraform/components/application/env/prd.tfvars
+# Examples are also safe to commit.
+!*.tfvars.example
 
 # Local Python test artifacts
 __pycache__/
+
+# Saved plans may contain confidential values.
+*.tfplan
 
 # Ignore override files as they are usually used to override resources locally and so
 # are not checked in

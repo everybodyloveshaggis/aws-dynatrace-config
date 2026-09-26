@@ -1,7 +1,7 @@
 """Exercise the real ephemeral AWS provider against a local Secrets Manager stub.
 
 Run: python3 -m unittest discover -s tests -p 'test_*.py' -v
-Requires Terraform and the locked providers (run terraform init first).
+Requires Terraform and the locked providers (initialize the application first).
 No real credentials, cloud backend, or external API calls are used.
 """
 
@@ -17,9 +17,13 @@ import unittest
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from zipfile import ZipFile
 
+from terraform_test_support import without_cloud_backend
+
 
 ROOT = Path(__file__).resolve().parents[1]
+APPLICATION = ROOT / "terraform" / "components" / "application"
 TOKEN = "test-only-dynatrace-token-must-not-persist"
+CLASSIC_TOKEN = "test-only-dynatrace-classic-token-must-not-persist"
 ARN = "arn:aws:secretsmanager:eu-west-2:123456789012:secret:test-AbCdEf"
 
 
@@ -65,13 +69,16 @@ class SecretHandlingTest(unittest.TestCase):
         cls.server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
         cls.thread = threading.Thread(target=cls.server.serve_forever, daemon=True)
         cls.thread.start()
-        for name in ("providers.tf", "variables.tf", "locals.tf", "secrets.tf", ".terraform.lock.hcl"):
-            shutil.copy2(ROOT / name, cls.work / name)
-        providers = (cls.work / "providers.tf").read_text()
-        providers, removed = re.subn(r'\n  cloud \{.*?\n  \}\n', "\n", providers, count=1, flags=re.S)
-        if removed != 1:
-            raise AssertionError("Could not isolate the test from Terraform Cloud")
-        (cls.work / "providers.tf").write_text(providers)
+        for name in ("providers.tf", "versions.tf", "variables.tf", "secrets.tf", ".terraform.lock.hcl"):
+            shutil.copy2(APPLICATION / name, cls.work / name)
+        versions = cls.work / "versions.tf"
+        versions.write_text(without_cloud_backend(versions.read_text()))
+        # Isolate the actual secret locals from unrelated SSM account routing.
+        secret_locals = [line for line in (APPLICATION / "locals.tf").read_text().splitlines()
+                         if re.match(r"\s*dynatrace_(secret|environment_url|platform_token)\s*=", line)]
+        if len(secret_locals) != 3:
+            raise AssertionError("Could not isolate the three secret locals")
+        (cls.work / "locals.tf").write_text("locals {\n" + "\n".join(secret_locals) + "\n}\n")
 
         endpoint = f"http://127.0.0.1:{cls.server.server_port}"
         overrides = []
@@ -98,7 +105,12 @@ class SecretHandlingTest(unittest.TestCase):
           output "account_id" { value = data.aws_caller_identity.test.account_id }
           output "secret_arn" { value = var.dynatrace_secret_arn }
         ''')
-        (cls.work / "terraform.tfvars.json").write_text(json.dumps({"dynatrace_secret_arn": ARN}))
+        (cls.work / "terraform.tfvars.json").write_text(json.dumps({
+            "dynatrace_secret_arn": ARN,
+            "dynatrace_environment_id": "example",
+            "environment": "dev",
+            "account_ids_ssm_path": "/test/accounts",
+        }))
         cls.env = {k: v for k, v in os.environ.items() if not k.startswith(("AWS_", "TF_", "DYNATRACE_"))}
         cls.env.update({
             "AWS_ACCESS_KEY_ID": "test-only-bootstrap-access-key",
@@ -108,9 +120,10 @@ class SecretHandlingTest(unittest.TestCase):
             "AWS_SHARED_CREDENTIALS_FILE": str(cls.work / "empty-credentials"),
         })
         command = ["init", "-backend=false", "-input=false"]
-        cache = ROOT / ".terraform" / "providers"
-        if cache.is_dir():
-            command.append(f"-plugin-dir={cache}")
+        for cache in (APPLICATION / ".terraform" / "providers", ROOT / ".terraform" / "providers"):
+            if cache.is_dir():
+                command.append(f"-plugin-dir={cache}")
+                break
         result = cls.run_tf(*command)
         if result.returncode:
             raise AssertionError(result.stdout)
@@ -130,9 +143,10 @@ class SecretHandlingTest(unittest.TestCase):
 
     def test_valid_secret_is_used_but_not_persisted(self):
         type(self).payload = json.dumps({"DYNATRACE_ENV_URL": "https://example.apps.dynatrace.com",
-                                        "DYNATRACE_PLATFORM_TOKEN": TOKEN})
+                                        "DYNATRACE_PLATFORM_TOKEN": TOKEN,
+                                        "DYNATRACE_API_TOKEN": CLASSIC_TOKEN})
         self.received_tokens.clear()
-        result = self.run_tf("plan", "-input=false", "-out=test.tfplan")
+        result = self.run_tf("plan", "-input=false", "-out=test.tfplan", "-var=aws_extension_version=1.0.5")
         self.assertEqual(result.returncode, 0, result.stdout)
         self.assertIn(TOKEN, self.received_tokens)
         with ZipFile(self.work / "test.tfplan") as plan:
@@ -141,7 +155,7 @@ class SecretHandlingTest(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stdout)
         artifacts.append((self.work / "terraform.tfstate").read_bytes())
         for artifact in artifacts:
-            for secret in (TOKEN, self.env["AWS_SECRET_ACCESS_KEY"]):
+            for secret in (TOKEN, CLASSIC_TOKEN, self.env["AWS_SECRET_ACCESS_KEY"]):
                 self.assertNotIn(secret.encode(), artifact)
         state = json.loads((self.work / "terraform.tfstate").read_text())
         self.assertEqual(state["outputs"]["secret_arn"]["value"], ARN)
@@ -153,12 +167,23 @@ class SecretHandlingTest(unittest.TestCase):
                         json.dumps({**valid, "DYNATRACE_PLATFORM_TOKEN": None}),
                         json.dumps({**valid, "DYNATRACE_PLATFORM_TOKEN": 123}),
                         json.dumps({**valid, "DYNATRACE_ENV_URL": "http://example.com"}),
-                        json.dumps({**valid, "DYNATRACE_ENV_URL": "https://example.com/path"})):
+                        json.dumps({**valid, "DYNATRACE_ENV_URL": "https://example.com/path"}),
+                        json.dumps({**valid, "DYNATRACE_ENV_URL": "https://wrong-tenant.apps.dynatrace.com"})):
             with self.subTest(payload=payload):
                 type(self).payload = payload
                 result = self.run_tf("plan", "-input=false")
                 self.assertNotEqual(result.returncode, 0)
                 self.assertIn("The Dynatrace secret must be a JSON object", result.stdout)
+                self.assertNotIn(TOKEN, result.stdout)
+
+    def test_extension_install_requires_classic_token(self):
+        valid = {"DYNATRACE_ENV_URL": "https://example.apps.dynatrace.com", "DYNATRACE_PLATFORM_TOKEN": TOKEN}
+        for classic_token in (None, " ", 123):
+            with self.subTest(classic_token=classic_token):
+                type(self).payload = json.dumps({**valid, "DYNATRACE_API_TOKEN": classic_token})
+                result = self.run_tf("plan", "-input=false", "-var=aws_extension_version=1.0.5")
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn("requires a non-empty classic DYNATRACE_API_TOKEN", " ".join(result.stdout.split()))
                 self.assertNotIn(TOKEN, result.stdout)
 
 
