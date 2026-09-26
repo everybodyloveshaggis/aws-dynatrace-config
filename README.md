@@ -1,150 +1,110 @@
-## AWS account monitoring
+# AWS Clouds monitoring
 
-This configuration creates a Clouds AWS monitoring connection, an IAM role, and a topology and metrics monitoring configuration for the AWS account mapped to the Terraform Cloud workspace. It can optionally stream all CloudWatch log groups in the configured AWS region to Dynatrace through Amazon Data Firehose. It uses the official `hashicorp/aws` and `dynatrace-oss/dynatrace` providers. The account ID is detected using `aws_caller_identity`; onboarding does not require AWS Organizations access.
-
-- `modules/application` contains only Dynatrace provider resources: the connection, role association, and monitoring settings.
-- `modules/infrastructure` contains only AWS provider resources: the monitoring IAM role and optional Firehose, subscription, IAM, S3 backup, and delivery diagnostics.
-- The root configures providers and credentials and connects the modules. The connection ID becomes the AWS role's external ID; the role ARN returns to the application after its policy is attached. Avoid module-wide `depends_on` between these modules, which would create a dependency cycle.
-
-### Authentication and monitoring
-
-The module follows [Dynatrace's AWS monitoring onboarding guide](https://docs.dynatrace.com/docs/ingest-from/amazon-web-services/create-an-aws-connection/aws-connection-api):
-
-- `dynatrace_aws_connection` uses `role_based_auth` with consumer `SVC:com.dynatrace.da`.
-- The IAM role trusts `arn:aws:iam::314146291599:root` for `sts:AssumeRole`, restricted by an external ID equal to the connection ID.
-- `dynatrace_aws_connection_role_arn` links the role after its policy attachment completes and retries for up to two minutes for IAM propagation.
-- `dynatrace_hub_extension_v2_config` enables the AWS extension's essential topology and metrics feature sets after the connection is ready. It reads the installed extension version instead of hardcoding one.
-
-The infrastructure module retains the AWS managed `ReadOnlyAccess` policy. This is broad; review it against your organization's policy standards. GovCloud and China partitions are not supported. Log forwarding is disabled by default; events ingestion is not configured.
-
-This integration does not use the workflow consumer `APP:dynatrace.aws.connector` or its OIDC provider. `dynatrace_aws_credentials` is a separate, classic AWS monitoring integration.
-
-### Prerequisites
-
-Install the `com.dynatrace.extension.da-aws` extension in the Dynatrace environment before planning. For a first connection, open **Settings > Collect and capture > Cloud and virtualization > AWS** and leave it open for about ten minutes, as described in the onboarding guide. The active-version data source requires an installed extension.
-
-Use Terraform 1.10 or later, including the Terraform version selected for the Terraform Cloud workspace. The AWS provider remains on the locked 5.100.0 release, which supports ephemeral Secrets Manager reads.
-
-AWS authentication continues to use the existing Terraform Cloud dynamic credentials configuration (`TFC_AWS_PROVIDER_AUTH=true` and `TFC_AWS_RUN_ROLE_ARN=arn:aws:iam::899045892145:role/terraform-role`). The default and secret-reading AWS providers use the same runner identity. No AWS access keys or session tokens are read into Terraform state or supplied in tfvars.
-
-An aliased AWS provider reads the Dynatrace JSON secret in the region from its ARN. The run role needs `secretsmanager:GetSecretValue` on that secret (and `kms:Decrypt` if it uses a customer-managed KMS key), plus permissions to manage the IAM role and policy attachment. The secret must contain:
-
-- `DYNATRACE_ENV_URL`: the platform environment URL, such as `https://abc12345.apps.dynatrace.com`.
-- `DYNATRACE_PLATFORM_TOKEN`: a platform token whose service user can manage the AWS connection and extension configuration.
-
-The read uses an [`ephemeral` resource](https://developer.hashicorp.com/terraform/language/block/ephemeral), so the secret response and derived provider credentials are omitted from state and saved plans. Invalid JSON, missing/empty token values, and invalid environment URLs stop the run with a configuration error. The environment URL must be an HTTPS origin without a path (an optional trailing slash is allowed).
-
-The platform token needs these scopes, with matching permissions assigned to its service user:
+Terraform manages a Dynatrace AWS connection and topology/metrics configuration for every account discovered through SSM. IAM lives in the separate **aws-dynatrace-iam** repository, with one workspace per AWS account. There is no AWS Organizations account discovery, CloudFormation, shell provisioner, log forwarding or events ingestion.
 
 ```text
-settings:objects:read
-settings:objects:write
-extensions:definitions:read
-extensions:configurations:read
-extensions:configurations:write
+aws-dynatrace-config/
+  terraform/
+    components/application/          # TFC working directory
+    modules/dynatrace-aws-cloud-v2/   # One account's Dynatrace resources
+
+aws-dynatrace-iam/                    # Separate sibling Git repository
+  terraform/
+    module_calls_to_resources/       # TFC working directory, one account per workspace
+    modules/dynatrace-aws-cloud-iam-role/
 ```
 
-The settings permissions must cover `builtin:hyperscaler-authentication.connections.aws`; the extension permissions must cover `com.dynatrace.extension.da-aws`. `settings.read` and `settings.write` are classic API-token scopes, not the platform-token scopes used here. The provider is configured explicitly with `platform_token`.
+## Workspaces and routing
 
-### Configuration
+All three application workspaces use `terraform/components/application` as their Terraform working directory. Include the repository's `terraform/modules` directory in the uploaded/VCS configuration. Use Terraform **1.10 or later** (CI uses 1.15.6).
 
-Set the secret ARN in the checked-in `secrets.auto.tfvars` file. It contains only the reference, never credentials:
+| TFC workspace | Terraform variable `environment` | Accounts |
+| --- | --- | --- |
+| `dynatrace-dev-application` | `dev` | `/arecps/dynatrace/dev_accounts` |
+| `dynatrace-tst-application` | `tst` | `/arecps/dynatrace/tst_accounts` |
+| `dynatrace-prd-application` | `prd` | All accounts minus dev and tst |
 
-```hcl
-dynatrace_secret_arn = "arn:aws:secretsmanager:eu-west-2:899045892145:secret:dynatrace-secrets-sPjhXs"
-```
+`account_ids_ssm_path` identifies the complete inventory. All three parameters must exist in the runner's AWS account and `aws_region`, using SSM `String` or `StringList` values. Values are comma-separated 12-digit IDs. Whitespace, duplicate IDs and empty CSV entries are discarded. For an empty classification, a String containing a space can represent an empty list. Dev/tst overlaps, malformed IDs and non-production accounts missing from the full inventory fail the plan. Each workspace creates resources only for its own environment.
 
-Terraform Cloud automatically loads this file with the configuration; no new workspace variable is needed. The `.gitignore` exception permits this specific ARN-only file while continuing to ignore other tfvars files. Keep the existing TFC AWS authentication settings. If `dynatrace_secret_arn` is already set as a workspace variable, that value takes precedence over the file.
+The application runner needs `ssm:GetParameter` on the three parameters and `secretsmanager:GetSecretValue` on its tenant secret (plus `kms:Decrypt` if required). It does not assume roles into monitored accounts or manage AWS resources. Keep TFC AWS dynamic credentials for the runner; configure a separate AWS run role in each IAM workspace.
 
-By default, monitoring covers `aws_region` (`eu-west-2`) and `us-east-1`. The latter is always included for global AWS resources. Override the monitored regions in workspace variables or `terraform.tfvars`:
+## Tenant credentials and extension
 
-```hcl
-aws_role_name     = "DynatraceAwsMonitoringRole"
-aws_region        = "eu-west-2"
-monitored_regions = ["eu-west-2", "eu-west-1"]
-```
+Set the inputs shown in [terraform.tfvars.example](terraform/components/application/terraform.tfvars.example) separately in each application workspace. Required inputs: `environment`, `account_ids_ssm_path`, `dynatrace_environment_id`, `dynatrace_secret_arn`.
 
-Both topology and metrics use the same region list. The connection name is `aws-<account-id>`. Outputs expose the AWS account ID, role ARN, Dynatrace connection ID, and monitoring configuration ID.
+The secret's JSON contains:
 
-### Optional CloudWatch log forwarding
-
-Leave `cloudwatch_logs` unset (or set it to `null`) for accounts without Firehose. Enable it per account with the following Terraform variable. The values below are examples; use your environment's actual ingest endpoint and secret ARN:
-
-```hcl
-cloudwatch_logs = {
-  endpoint_url = "https://abc12345.live.dynatrace.com/api/v2/logs/ingest/aws_firehose"
-  secret_arn   = "arn:aws:secretsmanager:eu-west-2:123456789012:secret:dynatrace-log-ingest-AbCdEf"
-
-  # Optional defaults:
-  # name                  = "dynatrace-cloudwatch-logs"
-  # backup_retention_days = 30
-  # secret_kms_key_arn     = "arn:aws:kms:eu-west-2:123456789012:key/..."
+```json
+{
+  "DYNATRACE_ENV_URL": "https://abc12345.apps.dynatrace.com",
+  "DYNATRACE_PLATFORM_TOKEN": "<platform-token>"
 }
 ```
 
-Store this non-secret configuration in a version-controlled account `.auto.tfvars` file (add a specific `.gitignore` exception for that file), or in the account's Terraform Cloud workspace as an HCL variable. The existing checked-in account configuration leaves log forwarding disabled. No token value belongs in tfvars.
+`dynatrace_environment_id` must match the URL's first hostname component. Secrets are read with an ephemeral AWS resource, keeping tokens out of state and saved plans. The secret is read in the region encoded by its ARN. No token values belong in tfvars.
 
-The referenced secret must already exist in the forwarding account and `aws_region`. Its JSON must contain `{"api_key":"<Dynatrace API token with logs.ingest permission>"}`. This is a log ingestion credential, separate from the platform token used to manage Dynatrace settings. Firehose reads the secret itself at runtime; Terraform only stores its ARN, never fetches its value, and does not populate Firehose's state-backed `access_key` argument. If the secret uses a customer-managed KMS key, supply `secret_kms_key_arn` and ensure that key's policy permits the delivery role to decrypt it. Back up or securely restore the ingestion secret as part of disaster recovery.
+The platform token and its service user need `settings:objects:read`, `settings:objects:write`, `extensions:definitions:read`, `extensions:configurations:read` and `extensions:configurations:write`, scoped to `builtin:hyperscaler-authentication.connections.aws` and `com.dynatrace.extension.da-aws` as described in the [Dynatrace guide](https://docs.dynatrace.com/docs/ingest-from/amazon-web-services/create-an-aws-connection/aws-connection-api).
 
-Use the full Firehose ingestion endpoint, normally on `live.dynatrace.com`, rather than the `apps.dynatrace.com` URL used by the Dynatrace provider. See [Dynatrace's Firehose setup](https://docs.dynatrace.com/docs/ingest-from/amazon-web-services/integrate-with-aws/aws-logs-ingest/lma-stream-logs-with-firehose) and [AWS's required secret format](https://docs.aws.amazon.com/firehose/latest/dev/secrets-manager-whats-secret.html).
+If the AWS extension is installed, leave `aws_extension_version = null`. For Terraform-managed installation/activation, set an explicit available version and add `DYNATRACE_API_TOKEN` to the secret. The [native extension resource](https://registry.terraform.io/providers/dynatrace-oss/dynatrace/latest/docs/resources/hub_extension_active_version) requires classic token scopes `extensions.write`, `extensionEnvironment.write`, `extension.read` and `extensionEnvironment.read`. A separate provider alias uses this classic credential only for installation; connection management uses the platform token. The installer uses the provider's Extensions API implementation. Compatibility with the AWS extension and your tenant still needs a live apply; its version is deliberately not guessed. Monitoring reads the active version after installation.
 
-Enabling this option creates:
+## Deployment sequence
 
-- A Firehose stream delivering directly to Dynatrace with GZIP HTTP requests, a 1 MiB / 60 second buffer, and 900 seconds of delivery retries. The CloudWatch envelope remains intact for Dynatrace to decode.
-- An encrypted, private S3 bucket for failed deliveries, expiring them after 30 days by default.
-- IAM roles restricted to this account's CloudWatch Logs, the delivery stream, backup bucket, and ingestion secret.
-- An account-level subscription with an empty event filter. It includes all existing and future subscription-capable CloudWatch log groups in `aws_region`, including CloudTrail and VPC flow logs. The stream's own diagnostic log group is the sole exclusion, preventing recursive delivery.
-- The Dynatrace extension's `cloudWatchLogsConfiguration`, enabled for `aws_region` only after the subscription is ready. Deployment remains `MANUAL`; Terraform manages the resources directly without CloudFormation stacks.
+Onboarding takes three ordered applies across the two repositories. No targeted apply or manual Dynatrace API request is needed.
 
-Log forwarding is regional. `monitored_regions` controls topology and metrics only; adding regions there does not deploy additional Firehose streams. CloudWatch subscriptions support the Standard log class and forward new events, not historical log contents. An account can have only one account-level subscription policy per region; an existing one must be reconciled or imported before applying this configuration. Existing log-group subscriptions are additive and can cause duplicate delivery if they already forward to Dynatrace. See [AWS subscription documentation](https://docs.aws.amazon.com/AmazonCloudWatch/latest/logs/Subscriptions.html) and [recursion prevention](https://docs.aws.amazon.com/AmazonCloudWatch/latest/logs/Subscriptions-recursion-prevention.html).
+1. **Application bootstrap:** apply the matching application workspace with new accounts absent from `ready_account_ids`. Keep existing ready accounts in the set. Connections are created without a role ARN; `aws_connections` publishes their complete objectIds and expected role identities.
+2. **Account IAM:** apply the IAM repo in each new account. It reads `tfe_outputs` from `dynatrace-<environment>-application`, selects its caller account ID, and uses `object_id` unchanged as `sts:ExternalId`. It creates the cross-account role and the two documented customer-managed policies.
+3. **Application activation:** add successfully provisioned accounts to `ready_account_ids` and apply again. Terraform associates each role ARN before enabling topology and metrics. Connection IDs remain unchanged.
 
-The Terraform run role needs permissions to manage Firehose, the backup S3 bucket and its configuration, CloudWatch log groups/streams/account policies, and the new IAM roles/inline policies, including `iam:PassRole`. The Firehose delivery role receives `secretsmanager:GetSecretValue` on the ingestion secret. The runner does not need to read that ingestion token.
+The bootstrap connection is incomplete until activation. The role ARN is calculated from the account ID, role path and role name, so there is no reverse state dependency. A TFC run trigger does not replace the readiness sequence or establish that IAM has applied successfully.
 
-Outputs `cloudwatch_logs_firehose_arn` and `cloudwatch_logs_backup_bucket` identify the stream and failed-delivery bucket; both are null when disabled. After applying, produce a new log event in a Standard log group, check Firehose's delivery metrics and diagnostic log stream, and confirm the event appears in Dynatrace. Creating a new group should require no further Terraform run.
+The IAM repo reads this **nonsensitive** output containing public identifiers:
 
-Setting `cloudwatch_logs = null` removes the forwarding resources and disables the Dynatrace log setting. The backup bucket deliberately has `force_destroy = false`: if failed deliveries exist, recover or explicitly dispose of them before removing the bucket. Do not treat this bucket as a permanent log archive; it contains failures only and has the configured retention period.
-
-### Migrating the module split
-
-Keep the existing workspace and state and run a normal plan. `moved.tf` maps all five existing managed resources from `module.aws_account` to `module.application` or `module.infrastructure`, preserving their remote identities. With log forwarding disabled, the split should not replace the monitoring IAM role or Dynatrace connection. Keep these move declarations until every account's state has migrated. The application module now takes `role_arn`; standalone consumers must create the AWS infrastructure separately.
-
-### Deploying
-
-Authenticate to Terraform Cloud, retain the workspace's AWS dynamic credentials setup, and run:
-
-```text
-terraform init
-terraform plan
-terraform apply
+```hcl
+aws_connections = {
+  "111111111111" = {
+    object_id               = "<entire-settings-objectId>"
+    environment             = "dev"
+    dynatrace_environment_id = "abc12345"
+    role_name               = "DynatraceAwsMonitoringRole"
+    role_path               = "/"
+    role_arn                = "arn:aws:iam::111111111111:role/DynatraceAwsMonitoringRole"
+  }
+}
 ```
 
-`aws_profile` is optional for local execution; leave it null when Terraform Cloud supplies AWS credentials. To onboard another account, change the workspace selected in `providers.tf`, configure that workspace's AWS run role, and update `secrets.auto.tfvars` to an accessible Dynatrace secret.
+The IAM workspace's TFE token needs output-read access to the corresponding application workspace. AWS dynamic credentials do not grant access to TFC outputs. The IAM README documents its `TFE_TOKEN` and Terraform variables.
 
-### Migrating the secret read
+## Existing deployments and lifecycle
 
-Run a normal plan and apply after this change. Terraform removes the old `data.aws_secretsmanager_secret_version.dynatrace` entry from the current state; the actual Secrets Manager secret is unchanged. The migration plan can still include the old value from its prior state. After the successful apply removes that entry, subsequent plans and state snapshots do not persist the fetched secret value.
+**Read [MIGRATION.md](MIGRATION.md) before applying this rewrite to existing state.** Changing the working directory does not migrate resources between TFC workspaces. Old resource addresses and state ownership need explicit migration.
 
-Earlier state versions and saved plans can still contain the old token. This code change does not erase Terraform Cloud history. Rotate the Dynatrace token after migrating if you need those historical copies to stop granting access, and handle old state/plan retention according to your requirements. AWS dynamic credentials already remain outside state and need no migration.
+The provider cannot change the role ARN on an existing connection. Keep `role_name` and `role_path` stable after activation; changing them requires replacing the connection and updating IAM with the new objectId. Removing an account from `ready_account_ids` removes its monitoring configuration, but the provider's association deletion is a no-op and does not revoke AWS access. Revoke/remove the role in IAM when offboarding, then remove its connection from the application inventory.
 
-### Migrating the failed OIDC configuration
+Removing an account from SSM destroys its connection on the next apply. Moving an account between environments creates a new objectId in the destination tenant: coordinate removal from the old workspace, bootstrap in the new one, IAM using the new environment's output, then activation. Removing an account from dev/tst without removing it from the full inventory assigns it to production by design.
 
-Run a full plan using the existing workspace and state. Switching authentication types replaces the Dynatrace connection, so its ID changes. Terraform updates the existing IAM role's trust policy with the new external ID, links the role, and creates the monitoring configuration. Any external references to the old connection ID must be updated.
+Monitoring includes `us-east-1` for global services and the configured regions. This supports commercial AWS accounts. The two Dynatrace-supplied policies replace AWS `ReadOnlyAccess`; they retain wildcard resources where specified by Dynatrace. `organizations:DescribeOrganization` is metadata access, not account enumeration.
 
-The obsolete `aws_iam_openid_connect_provider.dynatrace` is removed from this configuration and will be destroyed if it is in the workspace state. If other workflow roles use that provider, transfer its management to their Terraform configuration before applying this migration.
+## CLI and checks
 
-The migration requires permission to delete the old IAM OIDC provider. Review the replacement and deletion in the plan. Increasing the old timeout or adding policy dependencies cannot repair the previous OIDC audience mismatch.
+For CLI use, set `TF_CLOUD_ORGANIZATION` and `TF_WORKSPACE=dynatrace-dev-application` (or tst/prd), authenticate to TFC and run:
 
-### Local checks
-
-```text
-terraform fmt -check -recursive
-terraform validate
-terraform -chdir=modules/application init -backend=false
-terraform -chdir=modules/application test
-terraform -chdir=modules/infrastructure init -backend=false
-terraform -chdir=modules/infrastructure test
+```sh
+terraform -chdir=terraform/components/application init
+terraform -chdir=terraform/components/application plan
+terraform -chdir=terraform/components/application apply
 ```
 
-Use the same Terraform 1.10+ version as the root configuration. Tests use mocked AWS and Dynatrace providers; they do not provision infrastructure. They check monitoring authentication, external-ID restrictions, account binding, region handling, the account guard, optional log resources, account-wide subscription coverage, recursion prevention, runtime secret references, and Dynatrace log settings. A successful live apply is still required to verify tenant permissions and connectivity.
+GitHub plan/apply workflows run all three workspaces. Configure repository variable `TF_CLOUD_ORGANIZATION` and secret `TF_API_TOKEN`; tenant inputs belong in each TFC workspace. Keep the repository root as the upload context and configure the working directory so sibling modules are included. The original push-to-main apply behavior is retained.
 
-For secret handling, run `python3 -m unittest discover -s tests -p 'test_*.py' -v` with Terraform 1.10+ and Python 3 installed. These tests use the locked AWS provider against a local HTTP stub with synthetic credentials. They check malformed-secret rejection and verify that fetched credentials reach provider configuration but do not appear in state or saved plan contents. They use an isolated local backend and do not contact AWS, Dynatrace, or Terraform Cloud.
+Credential-free checks:
+
+```sh
+terraform fmt -check -recursive terraform
+terraform -chdir=terraform/components/application init -backend=false
+terraform -chdir=terraform/components/application validate
+terraform -chdir=terraform/modules/dynatrace-aws-cloud-v2 init -backend=false
+terraform -chdir=terraform/modules/dynatrace-aws-cloud-v2 test
+python3 -m unittest discover -s tests -p 'test_*.py' -v
+```
+
+Tests use mocked Dynatrace resources and a local synthetic Secrets Manager service. They cover routing, invalid inventories, bootstrap/activation, role identity, monitoring regions and secret handling without provisioning infrastructure. Live permissions and connectivity require a real plan/apply.
