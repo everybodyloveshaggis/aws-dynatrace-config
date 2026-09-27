@@ -39,5 +39,5 @@ module "aws_connections" {
   monitored_regions = local.monitored_regions
   enable_monitoring = contains(var.ready_account_ids, each.key)
 
-  depends_on = [terraform_data.account_routing, dynatrace_hub_extension_active_version.aws]
+  depends_on = [terraform_data.account_routing ]
 }

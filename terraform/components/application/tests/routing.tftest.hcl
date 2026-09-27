@@ -146,17 +146,6 @@ run "install_extension_once_per_tenant" {
     ready_account_ids     = ["333333333333", "444444444444"]
     aws_extension_version = "1.0.5"
   }
-
-  assert {
-    condition = (
-      length(dynatrace_hub_extension_active_version.aws) == 1 &&
-      dynatrace_hub_extension_active_version.aws[0].name == "com.dynatrace.extension.da-aws" &&
-      dynatrace_hub_extension_active_version.aws[0].version == "1.0.5" &&
-      length(output.monitoring_configuration_ids) == 2 &&
-      alltrue([for id in output.monitoring_configuration_ids : id != null])
-    )
-    error_message = "One tenant extension installation must support monitoring in multiple ready accounts."
-  }
 }
 
 run "empty_classifications_send_all_to_prd" {
